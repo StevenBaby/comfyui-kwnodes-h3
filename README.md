@@ -38,6 +38,26 @@ next clip. `trim_head` / `trim_tail` crop the anchor zones before saving, so a
 saved latent starts at the true content (needed for the next clip's anchors to
 match). 0 = save the full latent.
 
+### Load Latent for Minimax H3
+
+Address a slot by `prefix` + `index` — the mirror of Save Latent for Minimax H3.
+Save clip N with prefix P, read it back with the same P and N. No directory to
+point at and no list to refresh; it resolves `<prefix>-<index:05>.safetensors`
+the same way Multi Condition does, so a chain's wiring stays symmetric.
+
+### Load Latent File for Minimax H3
+
+Pick the latent from a dropdown. Same shape as Load Image (Path):
+
+- `directory` — where to look, relative to the ComfyUI root. VHS-style
+  autocomplete confined to the root.
+- `sub` (`include sub directory`) — also list latents in subdirectories, named
+  relative to the directory.
+- `latent` — the file dropdown, newest first.
+- `↻ Refresh` — re-scan the directory and select the newest latent.
+
+Use this one when you want to see what is on disk and choose by name.
+
 ### Video Trim for Minimax H3
 
 Drop the leading (and optionally trailing) pinned frames from a decoded clip,
