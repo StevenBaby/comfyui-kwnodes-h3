@@ -438,6 +438,11 @@ class H3MultiCondition(io.ComfyNode):
                     default=False,
                     tooltip="ON: lock a source audio track (forward lip-sync). OFF: continue the previous clip's tail audio.",
                 ),
+                io.Boolean.Input(
+                    "split_audio",
+                    default=True,
+                    tooltip="ON (default): slice source_audio by index into this clip's overlapping segment. OFF: use source_audio as-is (no index-based splitting). Only applies when lock_audio is on.",
+                ),
                 io.Int.Input(
                     "length",
                     default=124,
@@ -553,6 +558,7 @@ class H3MultiCondition(io.ComfyNode):
         audio_context_length=24,
         seam_min=0.8,
         lock_audio=False,
+        split_audio=True,
         ignore_head_latent=False,
         ignore_tail_latent=False,
         length=124,
@@ -691,10 +697,17 @@ class H3MultiCondition(io.ComfyNode):
             # so every clip ships a full `length` frames and the chain joins
             # losslessly.
             #   index N -> [(length - ctx) * N, (length - ctx) * N + length)
-            ctx = int(context_length)
-            start_frame = (length - ctx) * index
-            seg_len = length
-            segment = cls._slice_audio_segment(source_audio, start_frame, seg_len)
+            if split_audio:
+                ctx = int(context_length)
+                start_frame = (length - ctx) * index
+                seg_len = length
+                segment = cls._slice_audio_segment(source_audio, start_frame, seg_len)
+            else:
+                # Use the source audio as-is (no index-based splitting). The
+                # caller supplies a per-clip track that already matches this
+                # clip; _lock_audio still trims/pads it to `length` frames so it
+                # stays in lockstep with the video.
+                segment = source_audio
             latent, encoded_audio = cls._lock_audio(latent, segment, audio_vae, length)
             index_audio = segment
             # Inject the fitted audio latent as the conditioning's audio
