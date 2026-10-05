@@ -216,8 +216,9 @@ def _audio_tail_from_latent(latent, a_frames):
 # --- redraw (guide + redraw seam) helpers --------------------------------
 SEAM_MIN_MASK = 0.10
 SEAM_FLOOR_MIN = 0.0
-SEAM_FLOOR_MAX = 0.95
+SEAM_FLOOR_MAX = 1.0
 SEAM_TAPER_TOKENS = 4
+TAIL_TAPER_EXP = 3.0
 _REMASK_KEY = "kwnodes_h3_redraw_prefix_remask"
 
 
@@ -243,6 +244,29 @@ def _prefix_token_weights(prefix_steps, taper_steps=SEAM_TAPER_TOKENS, seam_min=
     weights.extend(
         1.0 + (floor - 1.0) * (float(i + 1) / float(taper)) for i in range(taper)
     )
+    return tuple(weights)
+
+
+def _tail_token_weights(total_steps, lock_steps, seam_min, exp=TAIL_TAPER_EXP):
+    """Tail seam weights: the last `lock_steps` steps sit at seam_min (locked),
+    the preceding steps ramp down from 1.0 with an ease-out curve (high values
+    held early, rapid drop-off just before the lock).
+
+    Uses frac = x**exp (x in [0,1] across the ramp), so exp > 1 keeps the mask
+    near 1.0 (free/redrawn) for most of the window and then plunges to seam_min
+    at the very end — a bezier/log-like tail. exp = 1 recovers linear.
+    """
+    n = int(total_steps)
+    lock = max(0, min(int(lock_steps), n))
+    floor = _clamp_seam_min(SEAM_MIN_MASK if seam_min is None else seam_min)
+    ramp_n = n - lock
+    weights = []
+    if ramp_n > 0:
+        for i in range(ramp_n):
+            x = 0.0 if ramp_n == 1 else float(i) / float(ramp_n - 1)
+            frac = x ** exp
+            weights.append(1.0 + (floor - 1.0) * frac)
+    weights.extend([floor] * lock)
     return tuple(weights)
 
 
@@ -453,9 +477,15 @@ class H3MultiCondition(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "context_length",
-                    options=["22", "5", "39", "56"],
+                    options=["5", "22", "39", "56"],
                     default="22",
                     tooltip="Frames of the previous clip's picture to pin. 22 is nearly seamless.",
+                ),
+                io.Combo.Input(
+                    "tail_match",
+                    options=["0", "1", "5", "22", "39", "56"],
+                    default="1",
+                    tooltip="Frames at the very END of this clip to lock for the seam into the next clip (tail anchor). The rest of the tail overlap is free-generated (only color-referenced). 0 = don't lock the tail at all (color reference only).",
                 ),
                 io.Int.Input(
                     "audio_context_length",
@@ -468,9 +498,9 @@ class H3MultiCondition(io.ComfyNode):
                     "seam_min",
                     default=0.8,
                     min=0.0,
-                    max=0.95,
-                    step=0.05,
-                    tooltip="Redraw strength at the seam. 0.0 = hard-lock (copy tail bit-for-bit); higher = redraw the seam more.",
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Redraw strength at the seam. 0.0 = hard-lock (copy tail bit-for-bit); higher = redraw the seam more. 1.0 = fully redraw (no lock).",
                 ),
                 io.Boolean.Input(
                     "ignore_head_latent",
@@ -559,6 +589,7 @@ class H3MultiCondition(io.ComfyNode):
         seam_min=0.8,
         lock_audio=False,
         split_audio=True,
+        tail_match="1",
         ignore_head_latent=False,
         ignore_tail_latent=False,
         length=124,
@@ -638,14 +669,7 @@ class H3MultiCondition(io.ComfyNode):
             if os.path.isfile(path):
                 tail_latent = cls._load_latent(path)
 
-        # ---- two-ended anchoring: pin the next clip's head into the tail ----
-        # No latent extension: the tail anchor (next clip's head, context_length
-        # frames) locks the last context_length frames of THIS clip's latent, so
-        # the tail matches the next clip's true start. Those frames are trimmed
-        # off afterward.
-        tail_ctx = int(context_length) if tail_latent is not None else 0
-
-        # ---- continuation: pin head (video + audio) + pin tail (video) ----
+        # ---- continuation: pin head (video + audio) into conditioning keyframes ----
         trim_head = 0
         trim_tail = 0
         if head_latent is not None:
@@ -659,12 +683,15 @@ class H3MultiCondition(io.ComfyNode):
         elif ignore_head_latent and index > 0:
             trim_head = int(context_length)
 
+        # ---- two-ended anchoring: reference the next clip's head as a color/
+        # spatial reference (ref), NOT a hard lock. The tail seam lock is done
+        # separately in _redraw_video via tail_match + taper mask.
         if tail_latent is not None:
             conditioning = cls._pin_tail_end(
                 conditioning,
                 latent,
                 tail_latent,
-                tail_ctx,
+                int(context_length),
             )
             # The tail anchor (index3's head) is the true continuation content:
             # it stays in the output, so trim_tail stays 0.
@@ -678,7 +705,7 @@ class H3MultiCondition(io.ComfyNode):
                 head_latent,
                 tail_latent,
                 int(context_length),
-                tail_ctx,
+                int(tail_match),
                 seam_min,
                 manual_frames=manual_frames,
             )
@@ -883,10 +910,18 @@ class H3MultiCondition(io.ComfyNode):
     # ------------------------------------------------------------------
     @classmethod
     def _pin_tail_end(cls, conditioning, latent, tail_latent, context_length):
-        """Pin the NEXT clip's head (tail_latent) into the current clip's TAIL,
-        as conditioning keyframes at the end of the timeline. This is the
-        two-ended-anchoring mirror of _pin_tail: _pin_tail anchors the previous
-        tail at the head, this anchors the next head at the tail."""
+        """Reference the NEXT clip's head (tail_latent) as a COLOR / SPATIAL
+        reference (minimax_refs), NOT a hard-locked keyframe.
+
+        The two-ended-anchoring mirror of _pin_tail. The tail anchor's job is
+        only to keep the current clip's tail *tonally* continuous with the next
+        clip's true start (C's opening keyframe supplies color + spatial info).
+        Hard-locking those frames as minimax_keyframes (img_update=False, never
+        denoised) dragged B's tail toward C's static opening keyframe and froze
+        the tail's motion. Refs carry the color/spatial guidance without pinning
+        the timeline, so the tail motion is free and only the final few frames
+        are locked for the seam via _redraw_video's taper mask.
+        """
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
         width = int(video.shape[4]) * 16
@@ -907,21 +942,26 @@ class H3MultiCondition(io.ComfyNode):
         if n < 1:
             return conditioning
 
-        # Take the HEAD of the tail latent (the next clip's first frames).
+        # Take the HEAD of the tail latent (the next clip's first frames) as a
+        # single color/spatial reference image (its first frame).
         blocks, offsets, covered = _video_head_from_latent(tail_latent, n)
-        span = covered
-
-        # Anchor these frames at the END of the current clip's timeline.
-        end_start = frame_count - span
-        keyframes = []
-        for p, blk in zip(offsets, blocks):
-            keyframes.append({"resolved_frame_index": end_start + p, "latent": blk})
+        if not blocks:
+            return conditioning
+        ref_blk = blocks[0]  # [1, C, 1, H, W] single frame latent (keep 5D: T=1)
+        latent_h = int(ref_blk.shape[3])
+        latent_w = int(ref_blk.shape[4])
+        ref_item = {
+            "kind": "image",
+            "latent_h": latent_h,
+            "latent_w": latent_w,
+            "latent": ref_blk,
+        }
 
         out = []
         for emb, extra in conditioning:
             d = extra.copy()
-            prior = list(d.get("minimax_keyframes") or [])
-            d["minimax_keyframes"] = prior + keyframes
+            prior = list(d.get("minimax_refs") or [])
+            d["minimax_refs"] = prior + [ref_item]
             out.append([emb, d])
         return out
 
@@ -933,7 +973,7 @@ class H3MultiCondition(io.ComfyNode):
         head_latent,
         tail_latent,
         context_length,
-        tail_ctx,
+        tail_match,
         seam_min,
         manual_frames=None,
     ):
@@ -988,7 +1028,8 @@ class H3MultiCondition(io.ComfyNode):
                     ].to(device=patched_video.device, dtype=patched_video.dtype)
 
         tail_steps = 0
-        if tail_latent is not None:
+        tail_lock_steps = 0
+        if tail_latent is not None and int(tail_match) > 0:
             src_video = _video_from_latent(tail_latent)
             src_w = int(src_video.shape[4]) * 16
             src_h = int(src_video.shape[3]) * 16
@@ -998,15 +1039,22 @@ class H3MultiCondition(io.ComfyNode):
                     % (src_w, src_h, width, height)
                 )
             available = _pixel_frames(int(src_video.shape[2]))
-            n = min(int(tail_ctx), available)
-            if n >= 1:
-                blocks, offsets, covered = _video_head_from_latent(tail_latent, n)
-                tail_head_video = torch.cat(blocks, dim=2)
-                tail_steps = min(int(tail_head_video.shape[2]), t - 1)
-                if tail_steps >= 1:
-                    patched_video[:, :, t - tail_steps :] = tail_head_video[
-                        :, :, :tail_steps
-                    ].to(device=patched_video.device, dtype=patched_video.dtype)
+            ctx = int(context_length)
+            if ctx > available:
+                ctx = available
+            # Write the next clip's opening `context_length` frames into this
+            # clip's tail as the alignment target. The mask (below) controls
+            # how much of that window is redrawn vs locked.
+            blocks, offsets, covered = _video_head_from_latent(tail_latent, ctx)
+            tail_head_video = torch.cat(blocks, dim=2)
+            tail_steps = min(int(tail_head_video.shape[2]), t - 1)
+            # lock the last `tail_match` frames (in latent steps)
+            tail_lock_steps = _steps_for_frames(int(tail_match)) or 0
+            tail_lock_steps = min(tail_lock_steps, tail_steps)
+            if tail_steps >= 1:
+                patched_video[:, :, t - tail_steps :] = tail_head_video[
+                    :, :, :tail_steps
+                ].to(device=patched_video.device, dtype=patched_video.dtype)
 
         # video mask [B,1,T,H,W] so mask[0,0] is [T,H,W] (H3 mask_row_values layout)
         video_mask = torch.ones(
@@ -1021,10 +1069,10 @@ class H3MultiCondition(io.ComfyNode):
             video_mask[:, :, : len(ramp)] = ramp.view(1, 1, len(ramp), 1, 1)
 
         if tail_steps >= 1:
-            # taper the tail end: the seam sits at the LAST step (the boundary
-            # into the next clip), so lock it there and taper toward 1.0 toward
-            # the interior — same orientation as the head, no flip.
-            weights = _prefix_token_weights(tail_steps, seam_min=seam)
+            # Tail seam: lock the last tail_lock_steps, ramp the preceding
+            # steps from 1.0 down to seam_min. Motion stays free at the
+            # interior and progressively locks toward the seam.
+            weights = _tail_token_weights(tail_steps, tail_lock_steps, seam)
             ramp = torch.tensor(
                 weights, device=patched_video.device, dtype=torch.float32
             )
