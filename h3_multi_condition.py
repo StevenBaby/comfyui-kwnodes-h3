@@ -213,6 +213,37 @@ def _audio_tail_from_latent(latent, a_frames):
     return tail, rt, float(overhang)
 
 
+def _audio_head_from_latent(latent, a_frames):
+    """Take the FIRST `a_frames` frames of a clip's audio stream (the head),
+    mirroring _audio_tail_from_latent but from the start. Used for the tail
+    anchor (next clip's opening audio)."""
+    parts = _streams_from_latent(latent)
+    if len(parts) < 2:
+        raise ValueError("Multi Condition: context latent has no audio stream.")
+    video, audio = parts[0], parts[1]
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    if audio.ndim == 3:
+        audio = audio.unsqueeze(0)
+    if audio.ndim != 4:
+        raise ValueError(
+            "Multi Condition: expected audio latent [B,C,2,T], got %s"
+            % (tuple(audio.shape),)
+        )
+    total_t = int(audio.shape[-1])
+    frames = _pixel_frames(int(video.shape[2]))
+    overhang = total_t - FRAME_RESCALE * frames
+    if not (-0.5 < overhang < 0.5):
+        overhang = 0.0
+    rt = int(round(a_frames / float(FPS) * AUDIO_HZ))
+    if rt > total_t:
+        rt = total_t
+    if rt < 1:
+        raise ValueError("Multi Condition: audio window is empty")
+    head = audio[:1, ..., :rt].clone()
+    return head, rt, float(overhang)
+
+
 # --- redraw (guide + redraw seam) helpers --------------------------------
 SEAM_MIN_MASK = 0.10
 SEAM_FLOOR_MIN = 0.0
@@ -692,6 +723,7 @@ class H3MultiCondition(io.ComfyNode):
                 latent,
                 tail_latent,
                 int(context_length),
+                int(audio_context_length),
             )
             # The tail anchor (index3's head) is the true continuation content:
             # it stays in the output, so trim_tail stays 0.
@@ -909,9 +941,9 @@ class H3MultiCondition(io.ComfyNode):
 
     # ------------------------------------------------------------------
     @classmethod
-    def _pin_tail_end(cls, conditioning, latent, tail_latent, context_length):
+    def _pin_tail_end(cls, conditioning, latent, tail_latent, context_length, audio_context_length):
         """Reference the NEXT clip's head (tail_latent) as a COLOR / SPATIAL
-        reference (minimax_refs), NOT a hard-locked keyframe.
+        reference (minimax_refs) + audio reference, NOT a hard-locked keyframe.
 
         The two-ended-anchoring mirror of _pin_tail. The tail anchor's job is
         only to keep the current clip's tail *tonally* continuous with the next
@@ -921,6 +953,10 @@ class H3MultiCondition(io.ComfyNode):
         the tail's motion. Refs carry the color/spatial guidance without pinning
         the timeline, so the tail motion is free and only the final few frames
         are locked for the seam via _redraw_video's taper mask.
+
+        Audio: C's opening audio is pinned as a soft audio keyframe at B's tail,
+        mirroring the head audio keyframe (_pin_tail), so B's tail audio leads
+        into C's opening sound.
         """
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
@@ -957,11 +993,31 @@ class H3MultiCondition(io.ComfyNode):
             "latent": ref_blk,
         }
 
+        # Tail audio: C's opening audio, pinned as a soft audio keyframe at B's
+        # tail (mirror of _pin_tail's head audio keyframe).
+        tail_audio_kf = None
+        if audio_context_length > 0:
+            a_frames = audio_context_length
+            audio_latent, ref_audio_t, overhang = _audio_head_from_latent(
+                tail_latent, a_frames
+            )
+            # Anchor C's opening audio at the END of B's timeline: the audio
+            # reference should end at (or slightly past) frame_count so B's tail
+            # sound leads into C's opening sound.
+            resolved_start = float(frame_count) - ref_audio_t / FRAME_RESCALE
+            tail_audio_kf = {
+                "resolved_frame_index": resolved_start,
+                "audio_latent": audio_latent,
+            }
+
         out = []
         for emb, extra in conditioning:
             d = extra.copy()
-            prior = list(d.get("minimax_refs") or [])
-            d["minimax_refs"] = prior + [ref_item]
+            prior_refs = list(d.get("minimax_refs") or [])
+            d["minimax_refs"] = prior_refs + [ref_item]
+            if tail_audio_kf is not None:
+                prior_kfs = list(d.get("minimax_keyframes") or [])
+                d["minimax_keyframes"] = prior_kfs + [tail_audio_kf]
             out.append([emb, d])
         return out
 
@@ -1085,8 +1141,11 @@ class H3MultiCondition(io.ComfyNode):
             if step is not None and 0 <= step < t:
                 video_mask[:, :, step] = 0.0
 
-        # audio stays untouched (locked by lock_audio if on); mask 0 keeps it.
-        audio_mask = torch.zeros_like(audio, dtype=torch.float32)
+        # Audio: when lock_audio is off (continuation), the audio stream must be
+        # denoised normally (mask 1) so it regenerates from the pinned audio
+        # keyframe — NOT locked to its (noise) initial value. _lock_audio (if
+        # run afterward) re-locks the audio to the source track with a zero mask.
+        audio_mask = torch.ones_like(audio, dtype=torch.float32)
 
         out = dict(latent)
         out["samples"] = comfy.nested_tensor.NestedTensor((patched_video, audio))
