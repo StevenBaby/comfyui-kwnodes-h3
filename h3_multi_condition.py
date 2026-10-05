@@ -1021,12 +1021,13 @@ class H3MultiCondition(io.ComfyNode):
             video_mask[:, :, : len(ramp)] = ramp.view(1, 1, len(ramp), 1, 1)
 
         if tail_steps >= 1:
-            # taper the tail end the same way (mirror: last step -> seam_min)
+            # taper the tail end: the seam sits at the LAST step (the boundary
+            # into the next clip), so lock it there and taper toward 1.0 toward
+            # the interior — same orientation as the head, no flip.
             weights = _prefix_token_weights(tail_steps, seam_min=seam)
             ramp = torch.tensor(
                 weights, device=patched_video.device, dtype=torch.float32
             )
-            ramp = torch.flip(ramp, dims=[0])
             video_mask[:, :, t - len(ramp) :] = ramp.view(1, 1, len(ramp), 1, 1)
 
         # Hard-lock the latent steps that hold a manual keyframe: mask 0 keeps
