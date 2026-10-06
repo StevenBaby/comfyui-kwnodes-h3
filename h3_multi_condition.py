@@ -249,7 +249,6 @@ SEAM_MIN_MASK = 0.10
 SEAM_FLOOR_MIN = 0.0
 SEAM_FLOOR_MAX = 1.0
 SEAM_TAPER_TOKENS = 4
-TAIL_TAPER_EXP = 3.0
 _REMASK_KEY = "kwnodes_h3_redraw_prefix_remask"
 
 
@@ -263,7 +262,56 @@ def _clamp_seam_min(value) -> float:
     return max(SEAM_FLOOR_MIN, min(SEAM_FLOOR_MAX, n))
 
 
-def _prefix_token_weights(prefix_steps, taper_steps=SEAM_TAPER_TOKENS, seam_min=None):
+# --- mask taper curve types ---------------------------------------------
+CURVE_LINEAR = "linear"
+CURVE_QUADRATIC = "quadratic"
+CURVE_CUBIC = "cubic"
+CURVE_QUARTIC = "quartic"
+CURVE_EXPONENTIAL = "exponential"
+CURVE_LOGARITHMIC = "logarithmic"
+CURVE_COSINE = "cosine"
+CURVE_SMOOTHSTEP = "smoothstep"
+
+CURVE_OPTIONS = [
+    CURVE_LINEAR,
+    CURVE_QUADRATIC,
+    CURVE_CUBIC,
+    CURVE_QUARTIC,
+    CURVE_EXPONENTIAL,
+    CURVE_LOGARITHMIC,
+    CURVE_COSINE,
+    CURVE_SMOOTHSTEP,
+]
+
+
+def _curve_frac(x, curve):
+    """Map x in [0,1] -> frac in [0,1] controlling the taper shape.
+
+    0 -> 1.0 (fully redrawn) and 1 -> seam_min (locked); the curve only shapes
+    how fast the ramp travels between those endpoints.
+    """
+    if curve == CURVE_LINEAR:
+        return x
+    if curve == CURVE_QUADRATIC:
+        return x * x
+    if curve == CURVE_CUBIC:
+        return x * x * x
+    if curve == CURVE_QUARTIC:
+        return x * x * x * x
+    if curve == CURVE_EXPONENTIAL:
+        # fast drop at the very end (ease-out), scaled so frac(1)=1
+        return (math.exp(4.0 * x) - 1.0) / (math.exp(4.0) - 1.0)
+    if curve == CURVE_LOGARITHMIC:
+        # steep early, slow late (ease-in)
+        return math.log1p(4.0 * x) / math.log1p(4.0)
+    if curve == CURVE_COSINE:
+        return 1.0 - math.cos(x * math.pi * 0.5)
+    if curve == CURVE_SMOOTHSTEP:
+        return x * x * (3.0 - 2.0 * x)
+    return x
+
+
+def _prefix_token_weights(prefix_steps, taper_steps=SEAM_TAPER_TOKENS, seam_min=None, curve=CURVE_LINEAR):
     """1.0 on the disposable head, taper toward seam_min (0 = hard-lock seam)."""
     n = int(prefix_steps)
     if n < 1:
@@ -273,20 +321,15 @@ def _prefix_token_weights(prefix_steps, taper_steps=SEAM_TAPER_TOKENS, seam_min=
     floor = _clamp_seam_min(SEAM_MIN_MASK if seam_min is None else seam_min)
     weights = [1.0] * head
     weights.extend(
-        1.0 + (floor - 1.0) * (float(i + 1) / float(taper)) for i in range(taper)
+        1.0 + (floor - 1.0) * _curve_frac(float(i + 1) / float(taper), curve)
+        for i in range(taper)
     )
     return tuple(weights)
 
 
-def _tail_token_weights(total_steps, lock_steps, seam_min, exp=TAIL_TAPER_EXP):
+def _tail_token_weights(total_steps, lock_steps, seam_min, curve=CURVE_LINEAR):
     """Tail seam weights: the last `lock_steps` steps sit at seam_min (locked),
-    the preceding steps ramp down from 1.0 with an ease-out curve (high values
-    held early, rapid drop-off just before the lock).
-
-    Uses frac = x**exp (x in [0,1] across the ramp), so exp > 1 keeps the mask
-    near 1.0 (free/redrawn) for most of the window and then plunges to seam_min
-    at the very end — a bezier/log-like tail. exp = 1 recovers linear.
-    """
+    the preceding steps ramp down from 1.0 to seam_min along `curve`."""
     n = int(total_steps)
     lock = max(0, min(int(lock_steps), n))
     floor = _clamp_seam_min(SEAM_MIN_MASK if seam_min is None else seam_min)
@@ -295,8 +338,7 @@ def _tail_token_weights(total_steps, lock_steps, seam_min, exp=TAIL_TAPER_EXP):
     if ramp_n > 0:
         for i in range(ramp_n):
             x = 0.0 if ramp_n == 1 else float(i) / float(ramp_n - 1)
-            frac = x ** exp
-            weights.append(1.0 + (floor - 1.0) * frac)
+            weights.append(1.0 + (floor - 1.0) * _curve_frac(x, curve))
     weights.extend([floor] * lock)
     return tuple(weights)
 
@@ -343,11 +385,12 @@ def _spatial_video_mask(
 class _VideoPrefixRemask:
     """Per-step video-prefix mask re-derivation (Director ``_PrefixRemask``, video-only)."""
 
-    def __init__(self, prefix_steps, video_shape, seam_min=None):
+    def __init__(self, prefix_steps, video_shape, seam_min=None, curve=CURVE_LINEAR):
         self.prefix_steps = int(prefix_steps)
         self.sigmas = ()
         self.video_shape = tuple(int(x) for x in video_shape)
         self.seam_min = _clamp_seam_min(SEAM_MIN_MASK if seam_min is None else seam_min)
+        self.curve = curve
 
     def _live_weights(self, sigma, sigmas=()):
         current = float(torch.as_tensor(sigma).detach().float().reshape(-1)[0])
@@ -359,7 +402,7 @@ class _VideoPrefixRemask:
             sigmas = self.sigmas
         ratio = _next_sigma_ratio(current, sigmas)
         live = []
-        for base in _prefix_token_weights(self.prefix_steps, seam_min=self.seam_min):
+        for base in _prefix_token_weights(self.prefix_steps, seam_min=self.seam_min, curve=self.curve):
             if base >= 0.999:
                 live.append(1.0)
             elif self.seam_min <= 0.0:
@@ -418,7 +461,7 @@ class _VideoPrefixRemask:
         return executor(*args, **kwargs)
 
 
-def _install_video_prefix_remask(model, latent, prefix_steps, seam_min):
+def _install_video_prefix_remask(model, latent, prefix_steps, seam_min, curve=CURVE_LINEAR):
     """Clone ``model`` and attach a per-step video-prefix remask wrapper."""
     import comfy.patcher_extension
 
@@ -442,7 +485,7 @@ def _install_video_prefix_remask(model, latent, prefix_steps, seam_min):
         return model
 
     patched = model.clone()
-    state = _VideoPrefixRemask(prefix_steps, tuple(streams[0].shape), seam_min=seam_min)
+    state = _VideoPrefixRemask(prefix_steps, tuple(streams[0].shape), seam_min=seam_min, curve=curve)
     if callable(getattr(patched, "add_wrapper_with_key", None)):
         patched.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.APPLY_MODEL,
@@ -517,6 +560,18 @@ class H3MultiCondition(io.ComfyNode):
                     options=["0", "1", "5", "22", "39", "56"],
                     default="1",
                     tooltip="Frames at the very END of this clip to lock for the seam into the next clip (tail anchor). The rest of the tail overlap is free-generated (only color-referenced). 0 = don't lock the tail at all (color reference only).",
+                ),
+                io.Combo.Input(
+                    "head_curve",
+                    options=CURVE_OPTIONS,
+                    default=CURVE_LINEAR,
+                    tooltip="Taper curve for the HEAD anchor mask (redraw -> lock). linear = even; quadratic/cubic/quartic/exponential = hold redraw longer then drop fast (ease-out); logarithmic/cosine = drop early then ease in; smoothstep = S-curve.",
+                ),
+                io.Combo.Input(
+                    "tail_curve",
+                    options=CURVE_OPTIONS,
+                    default=CURVE_LINEAR,
+                    tooltip="Taper curve for the TAIL seam mask (redraw -> lock). Same shapes as head_curve.",
                 ),
                 io.Int.Input(
                     "audio_context_length",
@@ -621,6 +676,8 @@ class H3MultiCondition(io.ComfyNode):
         lock_audio=False,
         split_audio=True,
         tail_match="1",
+        head_curve=CURVE_LINEAR,
+        tail_curve=CURVE_LINEAR,
         ignore_head_latent=False,
         ignore_tail_latent=False,
         length=124,
@@ -679,20 +736,16 @@ class H3MultiCondition(io.ComfyNode):
 
         # ---- load head (index-1) and tail (index+1) anchors ----
         # head = previous clip's tail (pins the current clip's HEAD).
-        #   ignore_head_latent skips it; a missing head errors.
+        #   ignore_head_latent skips it; a missing head is silently ignored
+        #   (same as ignore_head_latent — no error, head_latent stays None).
         # tail = next clip's head (pins the current clip's TAIL, for two-ended
         #   anchoring when generating a middle clip). ignore_tail_latent skips
         #   it; a missing tail is silently ignored.
         head_latent = None
         if index > 0 and not ignore_head_latent:
             path = cls._slot_path(prefix, index - 1)
-            if not os.path.isfile(path):
-                raise FileNotFoundError(
-                    "Multi Condition: no head latent for clip %d at %s. Generate "
-                    "clip %d first, or set ignore_head_latent."
-                    % (index - 1, path, index - 1)
-                )
-            head_latent = cls._load_latent(path)
+            if os.path.isfile(path):
+                head_latent = cls._load_latent(path)
 
         tail_latent = None
         if not ignore_tail_latent:
@@ -711,7 +764,10 @@ class H3MultiCondition(io.ComfyNode):
                 int(context_length),
                 int(audio_context_length),
             )
-        elif ignore_head_latent and index > 0:
+        elif index > 0:
+            # No head anchor (either ignore_head_latent, or the head latent file
+            # is missing — silently ignored). Still trim the empty head slot so
+            # the clip ships length - context_length net frames.
             trim_head = int(context_length)
 
         # ---- two-ended anchoring: reference the next clip's head as a color/
@@ -740,6 +796,8 @@ class H3MultiCondition(io.ComfyNode):
                 int(tail_match),
                 seam_min,
                 manual_frames=manual_frames,
+                head_curve=head_curve,
+                tail_curve=tail_curve,
             )
 
         # ---- audio drive: lock source audio (forward-looking) ----
@@ -782,6 +840,7 @@ class H3MultiCondition(io.ComfyNode):
                 latent,
                 prefix_steps,
                 seam_min,
+                curve=head_curve,
             )
 
         return io.NodeOutput(
@@ -1032,6 +1091,8 @@ class H3MultiCondition(io.ComfyNode):
         tail_match,
         seam_min,
         manual_frames=None,
+        head_curve=CURVE_LINEAR,
+        tail_curve=CURVE_LINEAR,
     ):
         """Pin the previous clip's tail (head anchor) and, optionally, the next
         clip's head (tail anchor) into the current latent samples, and build a
@@ -1118,7 +1179,7 @@ class H3MultiCondition(io.ComfyNode):
         )
 
         if head_steps >= 1:
-            weights = _prefix_token_weights(head_steps, seam_min=seam)
+            weights = _prefix_token_weights(head_steps, seam_min=seam, curve=head_curve)
             ramp = torch.tensor(
                 weights, device=patched_video.device, dtype=torch.float32
             )
@@ -1128,7 +1189,7 @@ class H3MultiCondition(io.ComfyNode):
             # Tail seam: lock the last tail_lock_steps, ramp the preceding
             # steps from 1.0 down to seam_min. Motion stays free at the
             # interior and progressively locks toward the seam.
-            weights = _tail_token_weights(tail_steps, tail_lock_steps, seam)
+            weights = _tail_token_weights(tail_steps, tail_lock_steps, seam, curve=tail_curve)
             ramp = torch.tensor(
                 weights, device=patched_video.device, dtype=torch.float32
             )
