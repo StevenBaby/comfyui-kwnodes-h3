@@ -27,6 +27,7 @@ from .h3_multi_condition import H3MultiCondition
 from .h3_save_latent import H3SaveLatent
 from .h3_load_latent import H3LoadLatent, H3LoadLatentFile
 from .h3_video_trim import H3VideoTrim
+from .h3_cond_noise_aug import H3CondNoiseAug
 
 WEB_DIRECTORY = "./web"
 
@@ -36,6 +37,7 @@ _NODES = [
     H3LoadLatent,
     H3LoadLatentFile,
     H3VideoTrim,
+    H3CondNoiseAug,
 ]
 
 
